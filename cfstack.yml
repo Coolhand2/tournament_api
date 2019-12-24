@@ -1,0 +1,283 @@
+Parameters:
+    TournamentVPC:
+      Type: 'AWS::EC2::VPC::Id'
+      Description: Select a VPC
+    TournamentPublicSubnets:
+      Type: 'List<AWS::EC2::Subnet::Id>'
+      Description: Select the subnets in your VPC.
+    TournamentDefaultSecurityGroup:
+      Type: 'AWS::EC2::SecurityGroup::Id'
+      Description: Select the appropriate default Security Group for your VPC
+    TournamentSshKeyName:
+      Type: 'AWS::EC2::KeyPair::KeyName'
+      Description: >-
+        Provide an SSH Key to connect to newly created EC2 instances, backing your
+        ECS containers.
+Mappings:
+    AWSRegionToAMI:
+      us-west-2:
+        AMIID: ami-0c5204531f799e0c6
+Resources:
+    TournamentApiCluster:
+      Type: 'AWS::ECS::Cluster'
+      Properties:
+        ClusterName: tournament_api_cluster
+        Tags:
+          - Key: Name
+            Value: Tournament API Cluster
+    TournamentApiTask:
+      Type: 'AWS::ECS::TaskDefinition'
+      DependsOn: TournamentApiAutoScalingGroup
+      Properties:
+        ContainerDefinitions:
+          - Name: TournamentApi
+            Image: !Join 
+              - ''
+              - - !Ref 'AWS::AccountId'
+                - .dkr.ecr.
+                - !Ref 'AWS::Region'
+                - '.amazonaws.com/tournament_api:latest'
+            Cpu: 10
+            Memory: 300
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref TournamentApiLogsGroup
+                awslogs-region: !Ref 'AWS::Region'
+                awslogs-stream-prefix: tournament-api
+            MountPoints:
+              - SourceVolume: TournamentApiData
+                ContainerPath: /opt/data
+                ReadOnly: false
+            PortMappings:
+              - HostPort: 443
+                ContainerPort: 3000
+        Volumes:
+          - Name: TournamentApiData
+            Host:
+              SourcePath: /opt/data
+    TournamentApiService:
+      Type: 'AWS::ECS::Service'
+      Properties:
+        Cluster: !Ref TournamentApiCluster
+        DesiredCount: 1
+        DeploymentConfiguration:
+          MaximumPercent: 100
+          MinimumHealthyPercent: 0
+        LoadBalancers:
+          - ContainerName: TournamentApi
+            ContainerPort: 3000
+            TargetGroupArn: !Ref TournamentApiTargetGroup
+        Role: !Ref TournamentApiServiceRole
+        TaskDefinition: !Ref TournamentApiTask
+      DependsOn: TournamentApiListener
+    TournamentApiLogsGroup:
+      Type: 'AWS::Logs::LogGroup'
+      Properties:
+        LogGroupName: !Join 
+          - '-'
+          - - TournamentApiLogGroup
+            - !Ref 'AWS::StackName'
+        RetentionInDays: 14
+    TournamentApiLoadBalancer:
+      Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+      Properties:
+        Name: TournamentApiLoadBalancer
+        Scheme: internet-facing
+        Subnets: !Ref TournamentPublicSubnets
+        Type: network
+        LoadBalancerAttributes:
+          - Key: load_balancing.cross_zone.enabled
+            Value: 'true'
+        Tags:
+          - Key: Name
+            Value: Tournament Api NLB
+    TournamentApiTargetGroup:
+      Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+      DependsOn: TournamentApiLoadBalancer
+      Properties:
+        Name: TournamentApiTargetGroup
+        Port: 3000
+        Protocol: TCP
+        VpcId: !Ref TournamentVPC
+        Tags:
+          - Key: Name
+            Value: Tournament API TG
+    TournamentApiListener:
+      Type: 'AWS::ElasticLoadBalancingV2::Listener'
+      Properties:
+        DefaultActions:
+          - Type: forward
+            TargetGroupArn: !Ref TournamentApiTargetGroup
+        LoadBalancerArn: !Ref TournamentApiLoadBalancer
+        Port: 80
+        Protocol: TCP
+    TournamentApiAutoScalingGroup:
+      Type: 'AWS::AutoScaling::AutoScalingGroup'
+      Properties:
+        VPCZoneIdentifier: !Ref TournamentPublicSubnets
+        LaunchConfigurationName: !Ref TournamentApiLaunchConfig
+        MinSize: '0'
+        MaxSize: '2'
+        DesiredCapacity: '1'
+        TargetGroupARNs:
+          - !Ref TournamentApiTargetGroup
+      CreationPolicy:
+        ResourceSignal:
+          Timeout: PT15M
+      UpdatePolicy:
+        AutoScalingRollingUpdate:
+          MinInstancesInService: '1'
+          MaxBatchSize: '1'
+          PauseTime: PT15M
+          WaitOnResourceSignals: 'true'
+    TournamentApiLaunchConfig:
+      Type: 'AWS::AutoScaling::LaunchConfiguration'
+      Properties:
+        ImageId: !FindInMap 
+          - AWSRegionToAMI
+          - !Ref 'AWS::Region'
+          - AMIID
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: io1
+              Iops: 500
+              DeleteOnTermination: true
+              VolumeSize: 10
+        SecurityGroups:
+          - !Ref TournamentDefaultSecurityGroup
+        InstanceType: t3.nano
+        IamInstanceProfile: !Ref TournamentApiInstanceProfile
+        KeyName: !Ref TournamentSshKeyName
+        UserData: !Base64 
+          'Fn::Sub': |
+            #!/bin/bash -xe
+            yum -y update
+            yum -y install aws-cfn-bootstrap
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource TournamentApiAutoScalingGroup --region ${AWS::Region}
+    TournamentApiInstanceProfile:
+      Type: 'AWS::IAM::InstanceProfile'
+      Properties:
+        Path: /
+        Roles:
+          - !Ref TournamentApiEC2Role
+    TournamentApiServiceRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        RoleName: TournamentApiServiceRole
+        Description: Tournament Api Service Role
+        Tags:
+          - Key: Name
+            Value: Tournament Api Service Role
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - ecs.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Path: /
+        Policies:
+          - PolicyName: TournamentApiServicePolicy
+            PolicyDocument:
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - 'elasticloadbalancing:DeregisterInstancesFromLoadBalancer'
+                    - 'elasticloadbalancing:DeregisterTargets'
+                    - 'elasticloadbalancing:Describe*'
+                    - 'elasticloadbalancing:RegisterInstancesWithLoadBalancer'
+                    - 'elasticloadbalancing:RegisterTargets'
+                    - 'ec2:Describe*'
+                    - 'ec2:AuthorizeSecurityGroupIngress'
+                  Resource: '*'
+    TournamentApiAutoscaleRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        RoleName: TournamentApiAutoscaleRole
+        Description: Tournament Api Autoscale Role
+        Tags:
+          - Key: Name
+            Value: Tournament Api Autoscale Role
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - application-autoscaling.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Path: /
+        Policies:
+          - PolicyName: TournamentApiAutoscalePolicy
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - 'application-autoscaling:*'
+                    - 'cloudwatch:DescribeAlarms'
+                    - 'cloudwatch:PutMetricAlarm'
+                    - 'ecs:DescribeServices'
+                    - 'ecs:UpdateService'
+                  Resource: '*'
+    TournamentApiEC2Role:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        RoleName: TournamentApiEC2Role
+        Description: Tournament Api EC2 Role
+        Tags:
+          - Key: Name
+            Value: Tournament Api EC2 Role
+        AssumeRolePolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - ec2.amazonaws.com
+                  - ecs.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Path: /
+        Policies:
+          - PolicyName: TournamentApiEC2Policy
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - 'ecs:CreateCluster'
+                    - 'ecs:DeregisterContainerInstance'
+                    - 'ecs:DiscoverPollEndpoint'
+                    - 'ecs:Poll'
+                    - 'ecs:RegisterContainerInstance'
+                    - 'ecs:StartTelemetrySession'
+                    - 'ecs:Submit*'
+                    - 'logs:CreateLogStream'
+                    - 'logs:PutLogEvents'
+                  Resource: '*'
+                - Effect: Allow
+                  Action:
+                    - 'ecr:GetAuthorizationToken'
+                    - 'ecr:BatchCheckLayerAvailability'
+                    - 'ecr:GetDownloadUrlForLayer'
+                    - 'ecr:GetRepositoryPolicy'
+                    - 'ecr:DescribeRepositories'
+                    - 'ecr:ListImages'
+                    - 'ecr:DescribeImages'
+                    - 'ecr:BatchGetImage'
+                  Resource: '*'
+                - Effect: Allow
+                  Action:
+                    - 'ec2:DescribeAvailabilityZones'
+                    - 'ec2:DescribeInstanceAttribute'
+                    - 'ec2:DescribeInstances'
+                    - 'ec2:DescribeRegions'
+                    - 'ec2:DescribeSecurityGroups'
+                    - 'ec2:DescribeTags'
+                  Resource: '*'
+  
